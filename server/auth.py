@@ -1,16 +1,101 @@
+import asyncio
+import json
+import logging
 import os
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from typing import TypeAlias
 
+import cachecontrol
+import requests as http_requests
 from db import get_db
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from jose import JWTError, jwt
 from models import APIKey, RefreshTokenJti, User
 from passlib.context import CryptContext
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
+AUTH_MODE_NATIVE = "native"
+AUTH_MODE_CLOUD_RUN_OIDC = "cloud_run_oidc"
+SUPPORTED_AUTH_MODES = {AUTH_MODE_NATIVE, AUTH_MODE_CLOUD_RUN_OIDC}
+
+PERMISSION_ADMIN = "admin"
+PERMISSION_MEMORY_ADD = "memory:add"
+PERMISSION_MEMORY_SEARCH = "memory:search"
+PERMISSION_MEMORY_READ = "memory:read"
+PERMISSION_MEMORY_UPDATE = "memory:update"
+PERMISSION_MEMORY_DELETE = "memory:delete"
+KNOWN_SERVICE_PERMISSIONS = frozenset(
+    {
+        PERMISSION_ADMIN,
+        PERMISSION_MEMORY_ADD,
+        PERMISSION_MEMORY_SEARCH,
+        PERMISSION_MEMORY_READ,
+        PERMISSION_MEMORY_UPDATE,
+        PERMISSION_MEMORY_DELETE,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ServicePrincipal:
+    """A Google service account authenticated with a Cloud Run ID token."""
+
+    subject: str
+    email: str
+    permissions: frozenset[str]
+
+    def has_permission(self, permission: str) -> bool:
+        return PERMISSION_ADMIN in self.permissions or permission in self.permissions
+
+
+AuthPrincipal: TypeAlias = User | ServicePrincipal | None
+
+
+def parse_service_principals(raw: str) -> dict[str, frozenset[str]]:
+    """Parse and validate the service-account permission map."""
+    if not raw.strip():
+        return {}
+
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MEM0_SERVICE_PRINCIPALS_JSON must be valid JSON.") from exc
+
+    if not isinstance(value, dict):
+        raise RuntimeError("MEM0_SERVICE_PRINCIPALS_JSON must be a JSON object.")
+
+    principals: dict[str, frozenset[str]] = {}
+    for email, permissions in value.items():
+        if not isinstance(email, str) or not email.strip():
+            raise RuntimeError("Every service principal must have a non-empty email address.")
+        if not isinstance(permissions, list) or not permissions:
+            raise RuntimeError(f"Permissions for {email!r} must be a non-empty JSON array.")
+        if not all(isinstance(permission, str) for permission in permissions):
+            raise RuntimeError(f"Permissions for {email!r} must all be strings.")
+
+        permission_set = frozenset(permissions)
+        unknown = permission_set - KNOWN_SERVICE_PERMISSIONS
+        if unknown:
+            raise RuntimeError(f"Unknown permissions for {email!r}: {', '.join(sorted(unknown))}.")
+
+        normalized_email = email.strip().casefold()
+        if normalized_email in principals:
+            raise RuntimeError(f"Duplicate service principal after normalization: {email!r}.")
+        principals[normalized_email] = permission_set
+
+    return principals
+
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
@@ -18,8 +103,71 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in {"1", "true", "yes", "on"}
+AUTH_MODE = os.environ.get("MEM0_AUTH_MODE", AUTH_MODE_NATIVE).strip().lower()
+CLOUD_RUN_EXPECTED_AUDIENCE = os.environ.get("CLOUD_RUN_EXPECTED_AUDIENCE", "").strip()
+SERVICE_PRINCIPALS = parse_service_principals(os.environ.get("MEM0_SERVICE_PRINCIPALS_JSON", ""))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def validate_auth_configuration() -> None:
+    """Fail startup when authentication configuration is unsafe or incomplete."""
+    if AUTH_MODE not in SUPPORTED_AUTH_MODES:
+        raise RuntimeError(
+            f"Unsupported MEM0_AUTH_MODE {AUTH_MODE!r}. Expected one of: {', '.join(sorted(SUPPORTED_AUTH_MODES))}."
+        )
+    if AUTH_DISABLED and AUTH_MODE != AUTH_MODE_NATIVE:
+        raise RuntimeError("AUTH_DISABLED cannot be combined with MEM0_AUTH_MODE=cloud_run_oidc.")
+    if AUTH_MODE == AUTH_MODE_NATIVE:
+        if not AUTH_DISABLED and not JWT_SECRET:
+            raise RuntimeError(
+                "JWT_SECRET is required in native auth mode. Generate one with `openssl rand -base64 48`, "
+                "or set AUTH_DISABLED=true for local development only."
+            )
+        return
+    if not CLOUD_RUN_EXPECTED_AUDIENCE:
+        raise RuntimeError("CLOUD_RUN_EXPECTED_AUDIENCE is required in cloud_run_oidc auth mode.")
+    if not SERVICE_PRINCIPALS:
+        raise RuntimeError("MEM0_SERVICE_PRINCIPALS_JSON must authorize at least one caller in cloud_run_oidc mode.")
+
+
+@lru_cache(maxsize=1)
+def _get_google_auth_request() -> GoogleAuthRequest:
+    # google-auth otherwise downloads Google's signing certificates for every
+    # verification. CacheControl honors the endpoint's cache headers and keeps
+    # verification off the network while the keys remain fresh.
+    session = cachecontrol.CacheControl(http_requests.Session())
+    return GoogleAuthRequest(session=session)
+
+
+def _verify_google_identity_token(token: str) -> dict:
+    return google_id_token.verify_oauth2_token(
+        token,
+        _get_google_auth_request(),
+        audience=CLOUD_RUN_EXPECTED_AUDIENCE,
+        clock_skew_in_seconds=30,
+    )
+
+
+async def _resolve_service_principal(token: str) -> ServicePrincipal:
+    try:
+        claims = await asyncio.to_thread(_verify_google_identity_token, token)
+    except (GoogleAuthError, ValueError) as exc:
+        logger.info("Rejected Cloud Run identity token", extra={"reason": type(exc).__name__})
+        raise HTTPException(status_code=401, detail="Invalid or expired Cloud Run identity token.") from exc
+
+    subject = claims.get("sub")
+    email = claims.get("email")
+    if not isinstance(subject, str) or not subject or not isinstance(email, str) or not email:
+        raise HTTPException(status_code=401, detail="Cloud Run identity token is missing subject or email claims.")
+
+    normalized_email = email.casefold()
+    permissions = SERVICE_PRINCIPALS.get(normalized_email)
+    if permissions is None:
+        logger.warning("Rejected unauthorized service principal", extra={"service_account": normalized_email})
+        raise HTTPException(status_code=403, detail="Service account is not authorized for this Mem0 server.")
+
+    return ServicePrincipal(subject=subject, email=normalized_email, permissions=permissions)
 
 
 def hash_password(password: str) -> str:
@@ -146,8 +294,20 @@ async def verify_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     x_api_key: str | None = Depends(api_key_header),
     db: Session = Depends(get_db),
-) -> User | None:
-    """Authenticate via JWT, X-API-Key, or legacy ADMIN_API_KEY. Returns User or None."""
+) -> AuthPrincipal:
+    """Authenticate using the configured native or Cloud Run OIDC mode."""
+    if AUTH_MODE == AUTH_MODE_CLOUD_RUN_OIDC:
+        if credentials is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Cloud Run identity token required.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        principal = await _resolve_service_principal(credentials.credentials)
+        _mark_auth_type(request, "cloud_run_oidc")
+        request.state.auth_principal = principal.email
+        return principal
+
     if credentials is not None:
         _mark_auth_type(request, "bearer")
         return _resolve_user_from_jwt(credentials.credentials, db)
@@ -170,12 +330,48 @@ async def verify_auth(
     )
 
 
+def principal_has_permission(request: Request, principal: AuthPrincipal, permission: str) -> bool:
+    """Check a route permission without changing native-mode behavior."""
+    if permission not in KNOWN_SERVICE_PERMISSIONS:
+        raise ValueError(f"Unknown Mem0 permission: {permission}")
+    if isinstance(principal, ServicePrincipal):
+        return principal.has_permission(permission)
+
+    auth_type = getattr(request.state, "auth_type", "none")
+    if permission == PERMISSION_ADMIN:
+        if isinstance(principal, User):
+            return principal.role == "admin"
+        return auth_type in {"admin_api_key", "disabled"}
+
+    # Native bearer/API-key users already had access to these endpoints.
+    # Preserve that behavior while service principals use explicit scopes.
+    return isinstance(principal, User) or auth_type in {"admin_api_key", "disabled"}
+
+
+def require_permission(permission: str):
+    """Build a FastAPI dependency that enforces a service-principal permission."""
+    if permission not in KNOWN_SERVICE_PERMISSIONS:
+        raise ValueError(f"Unknown Mem0 permission: {permission}")
+
+    async def dependency(
+        request: Request,
+        principal: AuthPrincipal = Depends(verify_auth),
+    ) -> AuthPrincipal:
+        if not principal_has_permission(request, principal, permission):
+            raise HTTPException(status_code=403, detail=f"Permission required: {permission}.")
+        return principal
+
+    return dependency
+
+
 async def require_auth(
     request: Request,
-    user: User | None = Depends(verify_auth),
+    user: AuthPrincipal = Depends(verify_auth),
     db: Session = Depends(get_db),
 ) -> User:
     """Like verify_auth but guarantees a non-None User. Use for endpoints that require auth."""
+    if isinstance(user, ServicePrincipal):
+        raise HTTPException(status_code=403, detail="A local user account is required for this endpoint.")
     if user is None:
         if getattr(request.state, "auth_type", "none") in {"admin_api_key", "disabled"}:
             default_user = _get_default_user(db)
@@ -186,20 +382,30 @@ async def require_auth(
 
 
 _BOOTSTRAP_ADMIN = User(
-    id=uuid.UUID(int=0), name="admin_api_key", email="", password_hash="", role="admin", created_at=datetime.min.replace(tzinfo=timezone.utc),
+    id=uuid.UUID(int=0),
+    name="admin_api_key",
+    email="",
+    password_hash="",
+    role="admin",
+    created_at=datetime.min.replace(tzinfo=timezone.utc),
 )
 
 
 async def require_admin(
     request: Request,
-    user: User | None = Depends(verify_auth),
+    user: AuthPrincipal = Depends(verify_auth),
     db: Session = Depends(get_db),
-) -> User:
+) -> User | ServicePrincipal:
     """Like require_auth but also enforces admin role.
 
     ADMIN_API_KEY and AUTH_DISABLED callers are treated as admin even when
     the users table is empty (fresh-deploy bootstrap).
     """
+    if isinstance(user, ServicePrincipal):
+        if user.has_permission(PERMISSION_ADMIN):
+            return user
+        raise HTTPException(status_code=403, detail="Admin permission required.")
+
     auth_type = getattr(request.state, "auth_type", "none")
     if user is None:
         if auth_type in {"admin_api_key", "disabled"}:
@@ -213,3 +419,9 @@ async def require_admin(
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin role required.")
     return user
+
+
+def require_native_auth_mode() -> None:
+    """Hide password/session endpoints when Cloud Run OIDC is authoritative."""
+    if AUTH_MODE != AUTH_MODE_NATIVE:
+        raise HTTPException(status_code=404, detail="Not found.")

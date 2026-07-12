@@ -15,6 +15,7 @@ from auth import (
     dummy_verify_password,
     hash_password,
     require_auth,
+    require_native_auth_mode,
     verify_password,
 )
 from db import get_db
@@ -23,7 +24,7 @@ from rate_limit import limiter
 from schemas import MessageResponse
 from telemetry import capture_admin_registered, capture_onboarding_completed
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(require_native_auth_mode)])
 
 MIN_PASSWORD_LENGTH = 8
 

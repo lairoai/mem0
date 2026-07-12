@@ -6,12 +6,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import generate_api_key, require_auth
+from auth import generate_api_key, require_auth, require_native_auth_mode
 from db import get_db
 from models import APIKey, User
 from schemas import MessageResponse
 
-router = APIRouter(prefix="/api-keys", tags=["api-keys"])
+router = APIRouter(prefix="/api-keys", tags=["api-keys"], dependencies=[Depends(require_native_auth_mode)])
 
 
 class CreateKeyRequest(BaseModel):

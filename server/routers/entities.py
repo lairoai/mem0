@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from auth import require_admin, verify_auth
+from auth import PERMISSION_MEMORY_READ, require_admin, require_permission
 from errors import upstream_error
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -41,7 +41,7 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 
 
 @router.get("", response_model=list[Entity])
-def list_entities(_auth=Depends(verify_auth)):
+def list_entities(_auth=Depends(require_permission(PERMISSION_MEMORY_READ))):
     buckets: dict[tuple[EntityType, str], dict[str, Any]] = defaultdict(
         lambda: {"total_memories": 0, "created_at": None, "updated_at": None}
     )

@@ -77,6 +77,81 @@ Then open `http://localhost:3000` and complete the setup wizard.
 - Auth is enabled by default.
 - `AUTH_DISABLED=true` exists for local development only and should not be used in production.
 
+## Cloud Run service-to-service authentication
+
+Set `MEM0_AUTH_MODE=cloud_run_oidc` to accept Google-signed identity tokens from explicitly authorized service
+accounts instead of Mem0 JWTs and API keys. The server validates the token signature, issuer, expiry, and exact audience,
+then maps its service-account email to route permissions. Password-login and API-key management endpoints return 404 in
+this mode.
+
+The supported permissions are:
+
+- `memory:add` — `POST /memories`
+- `memory:search` — `POST /search`
+- `memory:read` — scoped memory reads, history, and entity listing
+- `memory:update` — `PUT /memories/{memory_id}`
+- `memory:delete` — `DELETE /memories/{memory_id}`
+- `admin` — every operation, including all-memory listing, configuration, bulk deletion, reset, and request logs
+
+The caller map is deployment configuration, not a generated file. It can be placed directly in a Cloud Run service YAML;
+it contains identities and permissions, not credentials:
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mem0-api
+spec:
+  template:
+    spec:
+      containers:
+        - image: us-docker.pkg.dev/MY_PROJECT/mem0/api:latest
+          ports:
+            - name: http1
+              containerPort: 8000
+          env:
+            - name: MEM0_AUTH_MODE
+              value: cloud_run_oidc
+            - name: CLOUD_RUN_EXPECTED_AUDIENCE
+              value: https://mem0-api-abc123-uc.a.run.app
+            - name: MEM0_SERVICE_PRINCIPALS_JSON
+              value: >-
+                {"memory-writer@MY_PROJECT.iam.gserviceaccount.com":["memory:add"],"memory-searcher@MY_PROJECT.iam.gserviceaccount.com":["memory:search"],"admin-dashboard@MY_PROJECT.iam.gserviceaccount.com":["admin"]}
+```
+
+Use the canonical `run.app` service URL as the audience even when callers reach the service through a custom domain or
+load balancer. Each caller also needs `roles/run.invoker` on the Cloud Run service. For example:
+
+```bash
+gcloud run services add-iam-policy-binding mem0-api \
+  --region=us-central1 \
+  --member=serviceAccount:memory-writer@MY_PROJECT.iam.gserviceaccount.com \
+  --role=roles/run.invoker
+```
+
+A Cloud Run caller obtains an identity token for that same audience and sends it in the standard `Authorization` header.
+Do not use `X-Serverless-Authorization` with this mode because Cloud Run removes that token's signature before forwarding
+it to the container, preventing the API from independently validating it.
+
+```python
+import requests
+from google.auth.transport.requests import Request
+from google.oauth2.id_token import fetch_id_token
+
+audience = "https://mem0-api-abc123-uc.a.run.app"
+token = fetch_id_token(Request(), audience)
+response = requests.post(
+    f"{audience}/search",
+    json={"query": "project preferences", "user_id": "user-123"},
+    headers={"Authorization": f"Bearer {token}"},
+    timeout=30,
+)
+response.raise_for_status()
+```
+
+`fetch_id_token` uses application default credentials; on Cloud Run it obtains the ID token from the metadata server for
+the workload's attached service account, so no service-account key file is needed.
+
 ## Forgotten password
 
 Reset an admin password from the host while the stack is running:
