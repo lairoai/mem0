@@ -84,6 +84,21 @@ accounts instead of Mem0 JWTs and API keys. The server validates the token signa
 then maps its service-account email to route permissions. Password-login and API-key management endpoints return 404 in
 this mode.
 
+This app-level validation is the second of two layers. The first is Cloud Run itself: deploy the service with
+`--no-allow-unauthenticated` so Google's front end rejects anonymous traffic before it reaches the container (this also
+keeps `/docs` and `/openapi.json` private). Never grant `roles/run.invoker` to `allUsers`; grant it per caller as shown
+below.
+
+```bash
+gcloud run deploy mem0-api \
+  --image=us-docker.pkg.dev/MY_PROJECT/mem0/api:latest \
+  --region=us-central1 \
+  --no-allow-unauthenticated
+```
+
+`GET /health` stays unauthenticated in every mode; use it for Cloud Run startup and liveness probes, which reach the
+container directly and carry no IAM token.
+
 The supported permissions are:
 
 - `memory:add` — `POST /memories`
@@ -92,6 +107,14 @@ The supported permissions are:
 - `memory:update` — `PUT /memories/{memory_id}`
 - `memory:delete` — `DELETE /memories/{memory_id}`
 - `admin` — every operation, including all-memory listing, configuration, bulk deletion, reset, and request logs
+
+Permissions authorize operations, not data. A caller with `memory:search` can search any `user_id` — scoping results to
+the right end user is the calling service's responsibility, so only authorize services you trust to enforce their own
+user boundaries.
+
+Callers are matched by service-account email. Google never reuses a service account's numeric ID, but deleting a service
+account and creating a new one with the same name reuses its email — and with it any entry still in the map. Remove a
+service account's entry from `MEM0_SERVICE_PRINCIPALS_JSON` when you delete the account.
 
 The caller map is deployment configuration, not a generated file. It can be placed directly in a Cloud Run service YAML;
 it contains identities and permissions, not credentials:
@@ -151,6 +174,9 @@ response.raise_for_status()
 
 `fetch_id_token` uses application default credentials; on Cloud Run it obtains the ID token from the metadata server for
 the workload's attached service account, so no service-account key file is needed.
+
+Every request is recorded in the request log with the calling service account's email, and a principal with `admin` can
+audit them via `GET /requests`.
 
 ## Forgotten password
 

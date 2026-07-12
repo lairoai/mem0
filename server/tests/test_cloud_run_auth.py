@@ -68,7 +68,7 @@ def test_cloud_run_bearer_token_resolves_authorized_service_account(monkeypatch)
     monkeypatch.setattr(
         auth,
         "_verify_google_identity_token",
-        lambda token: {"sub": "service-account-id", "email": "Caller@Example.com"},
+        lambda token: {"sub": "service-account-id", "email": "Caller@Example.com", "email_verified": True},
     )
     request = _request()
 
@@ -95,7 +95,7 @@ def test_cloud_run_bearer_token_rejects_unlisted_service_account(monkeypatch):
     monkeypatch.setattr(
         auth,
         "_verify_google_identity_token",
-        lambda token: {"sub": "service-account-id", "email": "unknown@example.com"},
+        lambda token: {"sub": "service-account-id", "email": "unknown@example.com", "email_verified": True},
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -183,3 +183,96 @@ def test_native_user_keeps_existing_memory_access():
     assert auth.principal_has_permission(request, user, auth.PERMISSION_MEMORY_ADD)
     assert auth.principal_has_permission(request, user, auth.PERMISSION_MEMORY_SEARCH)
     assert not auth.principal_has_permission(request, user, auth.PERMISSION_ADMIN)
+
+
+def test_token_with_unverified_email_is_rejected(monkeypatch):
+    monkeypatch.setattr(auth, "AUTH_MODE", auth.AUTH_MODE_CLOUD_RUN_OIDC)
+    monkeypatch.setattr(
+        auth,
+        "SERVICE_PRINCIPALS",
+        {"caller@example.com": frozenset({auth.PERMISSION_MEMORY_ADD})},
+    )
+    monkeypatch.setattr(
+        auth,
+        "_verify_google_identity_token",
+        lambda token: {"sub": "service-account-id", "email": "caller@example.com"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            auth.verify_auth(
+                _request(),
+                HTTPAuthorizationCredentials(scheme="Bearer", credentials="signed-token"),
+                None,
+                None,
+            )
+        )
+
+    assert exc_info.value.status_code == 401
+    assert "verified" in exc_info.value.detail
+
+
+def test_certificate_fetch_failure_returns_503(monkeypatch):
+    monkeypatch.setattr(auth, "AUTH_MODE", auth.AUTH_MODE_CLOUD_RUN_OIDC)
+
+    def raise_transport_error(token):
+        raise auth.TransportError("certificate endpoint unreachable")
+
+    monkeypatch.setattr(auth, "_verify_google_identity_token", raise_transport_error)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            auth.verify_auth(
+                _request(),
+                HTTPAuthorizationCredentials(scheme="Bearer", credentials="signed-token"),
+                None,
+                None,
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+
+
+def test_config_read_allows_any_native_principal():
+    user = auth.User(
+        name="caller",
+        email="caller@example.com",
+        password_hash="unused",
+        role="user",
+    )
+
+    assert asyncio.run(auth.require_config_read(_request(), user)) is user
+    # ADMIN_API_KEY and AUTH_DISABLED callers resolve to a None principal.
+    assert asyncio.run(auth.require_config_read(_request(), None)) is None
+
+
+def test_config_read_requires_admin_for_service_principals():
+    reader = auth.ServicePrincipal(
+        subject="service-account-id",
+        email="reader@example.com",
+        permissions=frozenset({auth.PERMISSION_MEMORY_READ}),
+    )
+    admin = auth.ServicePrincipal(
+        subject="service-account-id",
+        email="admin@example.com",
+        permissions=frozenset({auth.PERMISSION_ADMIN}),
+    )
+
+    assert asyncio.run(auth.require_config_read(_request(), admin)) is admin
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(auth.require_config_read(_request(), reader))
+
+    assert exc_info.value.status_code == 403
+
+
+def test_native_only_routers_hidden_in_cloud_run_mode(monkeypatch):
+    monkeypatch.setattr(auth, "AUTH_MODE", auth.AUTH_MODE_CLOUD_RUN_OIDC)
+
+    with pytest.raises(HTTPException) as exc_info:
+        auth.require_native_auth_mode()
+
+    assert exc_info.value.status_code == 404
+
+    monkeypatch.setattr(auth, "AUTH_MODE", auth.AUTH_MODE_NATIVE)
+    auth.require_native_auth_mode()

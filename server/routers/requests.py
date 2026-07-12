@@ -19,6 +19,7 @@ class RequestLogItem(BaseModel):
     status_code: int
     latency_ms: float
     auth_type: str
+    auth_principal: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

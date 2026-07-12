@@ -18,6 +18,7 @@ from auth import (
     PERMISSION_MEMORY_UPDATE,
     principal_has_permission,
     require_admin,
+    require_config_read,
     require_permission,
     validate_auth_configuration,
 )
@@ -70,7 +71,7 @@ SENSITIVE_CONFIG_KEYS = {
     "secret",
     "token",
 }
-SKIPPED_REQUEST_LOG_PATHS = {"/api/health", "/docs", "/redoc", "/openapi.json"}
+SKIPPED_REQUEST_LOG_PATHS = {"/health", "/api/health", "/docs", "/redoc", "/openapi.json"}
 SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 
 BUNDLED_LLM_PROVIDERS = ("openai", "anthropic", "gemini")
@@ -280,7 +281,9 @@ def _should_log_request(request: Request) -> bool:
     return not path.startswith(SKIPPED_REQUEST_LOG_PREFIXES)
 
 
-def _persist_request_log(method: str, path: str, status_code: int, latency_ms: float, auth_type: str) -> None:
+def _persist_request_log(
+    method: str, path: str, status_code: int, latency_ms: float, auth_type: str, auth_principal: str | None
+) -> None:
     session = SessionLocal()
 
     try:
@@ -291,6 +294,7 @@ def _persist_request_log(method: str, path: str, status_code: int, latency_ms: f
                 status_code=status_code,
                 latency_ms=latency_ms,
                 auth_type=auth_type,
+                auth_principal=auth_principal,
             )
         )
         session.commit()
@@ -328,16 +332,17 @@ async def log_requests(request: Request, call_next):
                 status_code,
                 round((time.perf_counter() - start) * 1000, 2),
                 getattr(request.state, "auth_type", "none"),
+                getattr(request.state, "auth_principal", None),
             )
 
 
 @app.get("/configure", summary="Get current Mem0 configuration")
-def get_config(_auth=Depends(require_permission(PERMISSION_ADMIN))):
+def get_config(_auth=Depends(require_config_read)):
     return _redact_config(get_current_config())
 
 
 @app.get("/configure/providers", summary="List bundled LLM and embedder providers")
-def list_bundled_providers(_auth=Depends(require_permission(PERMISSION_ADMIN))):
+def list_bundled_providers(_auth=Depends(require_config_read)):
     return {"llm": list(BUNDLED_LLM_PROVIDERS), "embedder": list(BUNDLED_EMBEDDER_PROVIDERS)}
 
 
@@ -350,7 +355,7 @@ def set_config(config: Dict[str, Any], _auth=Depends(require_admin)):
 
 
 @app.post("/generate-instructions", summary="Generate custom instructions from a use case")
-def generate_instructions(req: GenerateInstructionsRequest, _auth=Depends(require_permission(PERMISSION_ADMIN))):
+def generate_instructions(req: GenerateInstructionsRequest, _auth=Depends(require_config_read)):
     """Generate custom instructions and a contextual test message tailored to a use case."""
     try:
         llm = get_memory_instance().llm
@@ -570,6 +575,12 @@ def reset_memory(_auth=Depends(require_admin)):
         return {"message": "All memories reset"}
     except Exception:
         raise upstream_error()
+
+
+@app.get("/health", summary="Liveness probe", include_in_schema=False)
+def health():
+    """Unauthenticated, mode-independent liveness check for readiness polling and Cloud Run probes."""
+    return {"status": "ok"}
 
 
 @app.get("/", summary="Redirect to the OpenAPI documentation", include_in_schema=False)

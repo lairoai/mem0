@@ -34,7 +34,7 @@ seed:
 
 wait-api:
 	@echo "Waiting for API..."
-	@until curl -fsS "$(API_URL)/auth/setup-status" >/dev/null 2>&1; do sleep 2; done
+	@until curl -fsS "$(API_URL)/health" >/dev/null 2>&1; do sleep 2; done
 
 wait-dashboard:
 	@echo "Waiting for dashboard..."
@@ -43,7 +43,7 @@ wait-dashboard:
 bootstrap: up wait-api wait-dashboard seed
 
 health:
-	@echo "API:       $$(curl -s -o /dev/null -w '%{http_code}' "$(API_URL)/docs")"
+	@echo "API:       $$(curl -s -o /dev/null -w '%{http_code}' "$(API_URL)/health")"
 	@echo "Dashboard: $$(curl -s -o /dev/null -w '%{http_code}' "$(DASHBOARD_URL)/api/health")"
 	@echo "Postgres:  $$(docker compose exec -T postgres pg_isready -q && echo 'ok' || echo 'down')"
 

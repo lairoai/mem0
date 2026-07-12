@@ -3,10 +3,10 @@ import json
 import logging
 import os
 import secrets
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from typing import TypeAlias
 
 import cachecontrol
@@ -14,7 +14,7 @@ import requests as http_requests
 from db import get_db
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from google.auth.exceptions import GoogleAuthError
+from google.auth.exceptions import GoogleAuthError, TransportError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
 from jose import JWTError, jwt
@@ -131,13 +131,21 @@ def validate_auth_configuration() -> None:
         raise RuntimeError("MEM0_SERVICE_PRINCIPALS_JSON must authorize at least one caller in cloud_run_oidc mode.")
 
 
-@lru_cache(maxsize=1)
+_google_auth_thread_local = threading.local()
+
+
 def _get_google_auth_request() -> GoogleAuthRequest:
     # google-auth otherwise downloads Google's signing certificates for every
     # verification. CacheControl honors the endpoint's cache headers and keeps
-    # verification off the network while the keys remain fresh.
-    session = cachecontrol.CacheControl(http_requests.Session())
-    return GoogleAuthRequest(session=session)
+    # verification off the network while the keys remain fresh. One session per
+    # thread because requests.Session is not thread-safe and verification runs
+    # on asyncio.to_thread workers.
+    request = getattr(_google_auth_thread_local, "request", None)
+    if request is None:
+        session = cachecontrol.CacheControl(http_requests.Session())
+        request = GoogleAuthRequest(session=session)
+        _google_auth_thread_local.request = request
+    return request
 
 
 def _verify_google_identity_token(token: str) -> dict:
@@ -152,6 +160,9 @@ def _verify_google_identity_token(token: str) -> dict:
 async def _resolve_service_principal(token: str) -> ServicePrincipal:
     try:
         claims = await asyncio.to_thread(_verify_google_identity_token, token)
+    except TransportError as exc:
+        logger.warning("Could not reach Google's certificate endpoint to verify identity token")
+        raise HTTPException(status_code=503, detail="Identity token verification is temporarily unavailable.") from exc
     except (GoogleAuthError, ValueError) as exc:
         logger.info("Rejected Cloud Run identity token", extra={"reason": type(exc).__name__})
         raise HTTPException(status_code=401, detail="Invalid or expired Cloud Run identity token.") from exc
@@ -160,6 +171,8 @@ async def _resolve_service_principal(token: str) -> ServicePrincipal:
     email = claims.get("email")
     if not isinstance(subject, str) or not subject or not isinstance(email, str) or not email:
         raise HTTPException(status_code=401, detail="Cloud Run identity token is missing subject or email claims.")
+    if claims.get("email_verified") is not True:
+        raise HTTPException(status_code=401, detail="Cloud Run identity token email is not verified by Google.")
 
     normalized_email = email.casefold()
     permissions = SERVICE_PRINCIPALS.get(normalized_email)
@@ -362,6 +375,20 @@ def require_permission(permission: str):
         return principal
 
     return dependency
+
+
+async def require_config_read(
+    request: Request,
+    principal: AuthPrincipal = Depends(verify_auth),
+) -> AuthPrincipal:
+    """Config-read access: any authenticated native caller, admin for service principals.
+
+    The dashboard configuration page and setup wizard load these endpoints for
+    every logged-in user, so native mode must not require the admin role.
+    """
+    if isinstance(principal, ServicePrincipal) and not principal.has_permission(PERMISSION_ADMIN):
+        raise HTTPException(status_code=403, detail=f"Permission required: {PERMISSION_ADMIN}.")
+    return principal
 
 
 async def require_auth(
