@@ -93,13 +93,11 @@ below.
 gcloud run deploy mem0-api \
   --image=us-docker.pkg.dev/MY_PROJECT/mem0/api:latest \
   --region=us-central1 \
-  --port=8000 \
   --no-allow-unauthenticated
 ```
 
-The image serves on port 8000, while Cloud Run sends requests to port 8080 unless told otherwise, so every deployment
-path has to declare the container port: `--port=8000` above, or `containerPort: 8000` in the service YAML below. Without
-it the revision fails its startup probe and never serves traffic.
+The container listens on `$PORT`, which Cloud Run injects, so the deployment does not need to pin a container port. It
+falls back to 8000 when `PORT` is unset, which is what `docker compose` and `make run_local` rely on.
 
 `GET /health` stays unauthenticated in every mode; use it for Cloud Run startup and liveness probes, which reach the
 container directly and carry no IAM token.
@@ -134,9 +132,6 @@ spec:
     spec:
       containers:
         - image: us-docker.pkg.dev/MY_PROJECT/mem0/api:latest
-          ports:
-            - name: http1
-              containerPort: 8000
           env:
             - name: MEM0_AUTH_MODE
               value: cloud_run_oidc
